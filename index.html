@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Noise Machine Ambience</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: #0c1220; }
+  input[type=range] { accent-color: #6366f1; }
+</style>
+</head>
+<body class="min-h-screen font-sans text-white" style="background:#0c1220">
+<div class="max-w-lg mx-auto px-4 py-8">
+  <h1 class="text-2xl font-bold text-center mb-1">Noise Machine</h1>
+  <p class="text-slate-400 text-center text-sm mb-6">Ambient sound mixer. Mix channels and save presets.</p>
+
+  <!-- Master volume -->
+  <div class="bg-slate-800 rounded-xl p-4 mb-4 flex items-center gap-4">
+    <span class="text-sm text-slate-300 w-24 shrink-0">Master Vol</span>
+    <input id="masterVol" type="range" min="0" max="100" value="80" class="flex-1" oninput="setMasterVolume(this.value)" aria-label="Master volume">
+    <span id="masterValDisplay" class="text-sm font-mono w-8 text-right">80%</span>
+  </div>
+
+  <!-- Channels -->
+  <div class="space-y-3 mb-6" id="channelList"></div>
+
+  <!-- Timer -->
+  <div class="bg-slate-800 rounded-xl p-4 mb-4">
+    <div class="flex items-center gap-3 flex-wrap">
+      <span class="text-sm text-slate-300">Auto-stop after</span>
+      <select id="timerSelect" class="bg-slate-700 text-white rounded-lg px-2 py-1 text-sm border border-slate-600 focus:outline-none" aria-label="Auto-stop timer duration">
+        <option value="0">Off</option>
+        <option value="5">5 min</option>
+        <option value="10">10 min</option>
+        <option value="20">20 min</option>
+        <option value="30">30 min</option>
+        <option value="60">60 min</option>
+      </select>
+      <button onclick="startTimer()" class="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-sm font-medium" aria-label="Start auto-stop timer">Set Timer</button>
+      <span id="timerDisplay" class="text-sm text-slate-400 font-mono"></span>
+    </div>
+  </div>
+
+  <!-- Presets -->
+  <div class="bg-slate-800 rounded-xl p-4">
+    <div class="flex items-center justify-between mb-3">
+      <span class="text-sm font-semibold text-slate-300">Presets (up to 5)</span>
+    </div>
+    <div class="flex gap-2 mb-3 flex-wrap">
+      <input id="presetName" type="text" placeholder="Preset name" class="flex-1 min-w-0 bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400" aria-label="Preset name">
+      <button onclick="savePreset()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-sm font-medium" aria-label="Save current mix as preset">Save Mix</button>
+    </div>
+    <div id="presetList" class="space-y-2"></div>
+  </div>
+</div>
+
+<script>
+const LS_KEY = 'nma_presets';
+let audioCtx = null;
+let masterGain = null;
+let timerInterval = null;
+let timerEnd = null;
+
+const CHANNELS = [
+  { id: 'white',  name: 'White Noise', icon: '🌫️', vol: 0,  muted: true,  type: 'white'  },
+  { id: 'brown',  name: 'Brown Noise', icon: '🌊', vol: 0,  muted: true,  type: 'brown'  },
+  { id: 'rain',   name: 'Rain',        icon: '🌧️', vol: 0,  muted: true,  type: 'rain'   },
+  { id: 'cafe',   name: 'Café Murmur', icon: '☕', vol: 0,  muted: true,  type: 'cafe'   },
+  { id: 'forest', name: 'Forest',      icon: '🌿', vol: 0,  muted: true,  type: 'forest' },
+];
+
+// Audio nodes per channel
+const nodes = {};
+
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.8;
+    masterGain.connect(audioCtx.destination);
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function createWhiteNoise(ctx) {
+  const bufferSize = ctx.sampleRate * 2;
+  const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.loop = true;
+  return src;
+}
+
+function createBrownNoise(ctx) {
+  const bufferSize = ctx.sampleRate * 2;
+  const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  let lastOut = 0;
+  for (let i = 0; i < bufferSize; i++) {
+    const white = Math.random() * 2 - 1;
+    data[i] = (lastOut + 0.02 * white) / 1.02;
+    lastOut = data[i];
+    data[i] *= 3.5;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.loop = true;
+  return src;
+}
+
+function createRain(ctx) {
+  // White noise through lowpass filter to simulate rain
+  const src = createWhiteNoise(ctx);
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 1000;
+  filter.Q.value = 0.5;
+  src.connect(filter);
+  return { src, extraNodes: [filter], output: filter };
+}
+
+function createCafe(ctx) {
+  // Multiple oscillators at human-speech frequencies + brown noise
+  const osc1 = ctx.createOscillator();
+  osc1.type = 'sine';
+  osc1.frequency.value = 280;
+  const osc2 = ctx.createOscillator();
+  osc2.type = 'sine';
+  osc2.frequency.value = 340;
+  const osc3 = ctx.createOscillator();
+  osc3.type = 'sine';
+  osc3.frequency.value = 180;
+
+  const merger = ctx.createChannelMerger(1);
+  const gOsc = ctx.createGain();
+  gOsc.gain.value = 0.05;
+  osc1.connect(gOsc); osc2.connect(gOsc); osc3.connect(gOsc);
+
+  const src = createBrownNoise(ctx);
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 800;
+  src.connect(filter);
+
+  const mix = ctx.createGain();
+  mix.gain.value = 1;
+  gOsc.connect(mix);
+  filter.connect(mix);
+
+  // LFO for wobble
+  const lfo = ctx.createOscillator();
+  lfo.frequency.value = 0.3;
+  const lfoGain = ctx.createGain();
+  lfoGain.gain.value = 0.02;
+  lfo.connect(lfoGain);
+  lfoGain.connect(gOsc.gain);
+
+  osc1.start(); osc2.start(); osc3.start(); lfo.start();
+  return { extraOsc: [osc1, osc2, osc3, lfo], src, extraNodes: [filter, gOsc, lfoGain, mix], output: mix };
+}
+
+function createForest(ctx) {
+  // Filtered noise + gentle oscillators
+  const src = createWhiteNoise(ctx);
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 600;
+  filter.Q.value = 0.3;
+  src.connect(filter);
+
+  const osc = ctx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = 220;
+  const oscGain = ctx.createGain();
+  oscGain.gain.value = 0.03;
+  osc.connect(oscGain);
+
+  const lfo = ctx.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.value = 0.5;
+  const lfoG = ctx.createGain();
+  lfoG.gain.value = 50;
+  lfo.connect(lfoG);
+  lfoG.connect(filter.frequency);
+
+  const mix = ctx.createGain();
+  mix.gain.value = 1;
+  filter.connect(mix);
+  oscGain.connect(mix);
+
+  osc.start(); lfo.start();
+  return { src, extraOsc: [osc, lfo], extraNodes: [filter, oscGain, lfoG, mix], output: mix };
+}
+
+function startChannel(ch) {
+  ensureAudioCtx();
+  if (nodes[ch.id]) return;
+
+  const gain = audioCtx.createGain();
+  gain.gain.value = ch.muted ? 0 : ch.vol / 100;
+  gain.connect(masterGain);
+
+  let built;
+  switch (ch.type) {
+    case 'white':  { const s = createWhiteNoise(audioCtx); s.connect(gain); s.start(); built = { src: s, gain }; break; }
+    case 'brown':  { const s = createBrownNoise(audioCtx); s.connect(gain); s.start(); built = { src: s, gain }; break; }
+    case 'rain':   { const r = createRain(audioCtx); r.src.connect(r.extraNodes[0]); r.output.connect(gain); r.src.start(); built = { src: r.src, gain, extra: r.extraNodes }; break; }
+    case 'cafe':   { const c = createCafe(audioCtx); c.src.start(); c.output.connect(gain); built = { src: c.src, gain, extraOsc: c.extraOsc, extra: c.extraNodes }; break; }
+    case 'forest': { const f = createForest(audioCtx); f.src.start(); f.output.connect(gain); built = { src: f.src, gain, extraOsc: f.extraOsc, extra: f.extraNodes }; break; }
+  }
+  nodes[ch.id] = built;
+}
+
+function stopChannel(ch) {
+  const n = nodes[ch.id];
+  if (!n) return;
+  try {
+    n.src.stop();
+    if (n.extraOsc) n.extraOsc.forEach(o => { try { o.stop(); } catch(e){} });
+  } catch(e) {}
+  delete nodes[ch.id];
+}
+
+function setChannelVolume(chId, val) {
+  const ch = CHANNELS.find(c => c.id === chId);
+  if (!ch) return;
+  ch.vol = parseInt(val);
+  if (!ch.muted && nodes[chId]) {
+    nodes[chId].gain.gain.setTargetAtTime(ch.vol / 100, audioCtx.currentTime, 0.05);
+  }
+  document.getElementById('vol-val-' + chId).textContent = ch.vol + '%';
+}
+
+function toggleMute(chId) {
+  const ch = CHANNELS.find(c => c.id === chId);
+  if (!ch) return;
+  ch.muted = !ch.muted;
+  const btn = document.getElementById('mute-btn-' + chId);
+  if (ch.muted) {
+    if (nodes[chId]) nodes[chId].gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
+    btn.textContent = '▶ On';
+    btn.className = 'px-3 py-1 rounded-lg text-xs font-medium bg-slate-600 text-slate-300';
+  } else {
+    startChannel(ch);
+    if (nodes[chId]) nodes[chId].gain.gain.setTargetAtTime(ch.vol / 100, audioCtx.currentTime, 0.05);
+    btn.textContent = '⏸ Mute';
+    btn.className = 'px-3 py-1 rounded-lg text-xs font-medium bg-indigo-600 text-white';
+  }
+}
+
+function setMasterVolume(val) {
+  document.getElementById('masterValDisplay').textContent = val + '%';
+  if (masterGain) masterGain.gain.setTargetAtTime(val / 100, audioCtx.currentTime, 0.05);
+}
+
+function renderChannels() {
+  const list = document.getElementById('channelList');
+  list.innerHTML = '';
+  CHANNELS.forEach(ch => {
+    const card = document.createElement('div');
+    card.className = 'bg-slate-800 rounded-xl p-4';
+
+    const top = document.createElement('div');
+    top.className = 'flex items-center justify-between mb-3';
+
+    const nameDiv = document.createElement('div');
+    nameDiv.className = 'flex items-center gap-2';
+    const icon = document.createElement('span');
+    icon.textContent = ch.icon;
+    const name = document.createElement('span');
+    name.className = 'font-medium text-sm text-white';
+    name.textContent = ch.name;
+    nameDiv.appendChild(icon);
+    nameDiv.appendChild(name);
+
+    const muteBtn = document.createElement('button');
+    muteBtn.id = 'mute-btn-' + ch.id;
+    muteBtn.className = ch.muted
+      ? 'px-3 py-1 rounded-lg text-xs font-medium bg-slate-600 text-slate-300'
+      : 'px-3 py-1 rounded-lg text-xs font-medium bg-indigo-600 text-white';
+    muteBtn.textContent = ch.muted ? '▶ On' : '⏸ Mute';
+    muteBtn.setAttribute('aria-label', 'Toggle ' + ch.name);
+    muteBtn.onclick = () => toggleMute(ch.id);
+
+    top.appendChild(nameDiv);
+    top.appendChild(muteBtn);
+
+    const volRow = document.createElement('div');
+    volRow.className = 'flex items-center gap-3';
+    const volSlider = document.createElement('input');
+    volSlider.type = 'range';
+    volSlider.min = '0';
+    volSlider.max = '100';
+    volSlider.value = ch.vol;
+    volSlider.className = 'flex-1';
+    volSlider.id = 'vol-slider-' + ch.id;
+    volSlider.setAttribute('aria-label', ch.name + ' volume');
+    volSlider.oninput = () => setChannelVolume(ch.id, volSlider.value);
+    const volVal = document.createElement('span');
+    volVal.id = 'vol-val-' + ch.id;
+    volVal.className = 'text-xs text-slate-400 w-8 text-right font-mono';
+    volVal.textContent = ch.vol + '%';
+    volRow.appendChild(volSlider);
+    volRow.appendChild(volVal);
+
+    card.appendChild(top);
+    card.appendChild(volRow);
+    list.appendChild(card);
+  });
+}
+
+function startTimer() {
+  clearInterval(timerInterval);
+  const mins = parseInt(document.getElementById('timerSelect').value);
+  if (mins === 0) {
+    document.getElementById('timerDisplay').textContent = '';
+    return;
+  }
+  timerEnd = Date.now() + mins * 60 * 1000;
+  timerInterval = setInterval(() => {
+    const remaining = timerEnd - Date.now();
+    if (remaining <= 0) {
+      clearInterval(timerInterval);
+      // Stop all channels
+      CHANNELS.forEach(ch => {
+        if (!ch.muted) {
+          ch.muted = true;
+          if (nodes[ch.id]) nodes[ch.id].gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.5);
+          const btn = document.getElementById('mute-btn-' + ch.id);
+          if (btn) { btn.textContent = '▶ On'; btn.className = 'px-3 py-1 rounded-lg text-xs font-medium bg-slate-600 text-slate-300'; }
+        }
+      });
+      document.getElementById('timerDisplay').textContent = 'Stopped';
+      return;
+    }
+    const m = Math.floor(remaining / 60000);
+    const s = Math.floor((remaining % 60000) / 1000);
+    document.getElementById('timerDisplay').textContent = m + ':' + String(s).padStart(2, '0') + ' left';
+  }, 1000);
+}
+
+function savePreset() {
+  const name = document.getElementById('presetName').value.trim();
+  if (!name) return;
+  let presets = [];
+  try { presets = JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch(e) {}
+  if (presets.length >= 5) { alert('Maximum 5 presets. Delete one first.'); return; }
+  const mix = CHANNELS.map(ch => ({ id: ch.id, vol: ch.vol, muted: ch.muted }));
+  presets.push({ name, mix, masterVol: parseInt(document.getElementById('masterVol').value) });
+  localStorage.setItem(LS_KEY, JSON.stringify(presets));
+  document.getElementById('presetName').value = '';
+  renderPresets();
+}
+
+function loadPreset(idx) {
+  let presets = [];
+  try { presets = JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch(e) {}
+  const p = presets[idx];
+  if (!p) return;
+  p.mix.forEach(pm => {
+    const ch = CHANNELS.find(c => c.id === pm.id);
+    if (!ch) return;
+    const wasMuted = ch.muted;
+    ch.vol = pm.vol;
+    ch.muted = pm.muted;
+    const slider = document.getElementById('vol-slider-' + ch.id);
+    const valDisp = document.getElementById('vol-val-' + ch.id);
+    const btn = document.getElementById('mute-btn-' + ch.id);
+    if (slider) slider.value = ch.vol;
+    if (valDisp) valDisp.textContent = ch.vol + '%';
+    if (btn) {
+      btn.textContent = ch.muted ? '▶ On' : '⏸ Mute';
+      btn.className = ch.muted
+        ? 'px-3 py-1 rounded-lg text-xs font-medium bg-slate-600 text-slate-300'
+        : 'px-3 py-1 rounded-lg text-xs font-medium bg-indigo-600 text-white';
+    }
+    if (!ch.muted) {
+      startChannel(ch);
+      if (nodes[ch.id]) nodes[ch.id].gain.gain.setTargetAtTime(ch.vol / 100, audioCtx.currentTime, 0.1);
+    } else {
+      if (nodes[ch.id]) nodes[ch.id].gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+    }
+  });
+  if (p.masterVol !== undefined) {
+    document.getElementById('masterVol').value = p.masterVol;
+    document.getElementById('masterValDisplay').textContent = p.masterVol + '%';
+    if (masterGain) masterGain.gain.setTargetAtTime(p.masterVol / 100, audioCtx.currentTime, 0.1);
+  }
+}
+
+function deletePreset(idx) {
+  let presets = [];
+  try { presets = JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch(e) {}
+  presets.splice(idx, 1);
+  localStorage.setItem(LS_KEY, JSON.stringify(presets));
+  renderPresets();
+}
+
+function renderPresets() {
+  let presets = [];
+  try { presets = JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch(e) {}
+  const list = document.getElementById('presetList');
+  list.innerHTML = '';
+  if (presets.length === 0) {
+    const p = document.createElement('p');
+    p.className = 'text-slate-500 text-xs italic';
+    p.textContent = 'No presets saved yet.';
+    list.appendChild(p);
+    return;
+  }
+  presets.forEach((preset, i) => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center justify-between bg-slate-700 rounded-lg px-3 py-2';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'text-sm text-white';
+    nameEl.textContent = preset.name;
+
+    const actions = document.createElement('div');
+    actions.className = 'flex gap-2';
+
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'text-xs px-2 py-1 rounded bg-indigo-600 hover:bg-indigo-700 text-white';
+    loadBtn.textContent = 'Load';
+    loadBtn.setAttribute('aria-label', 'Load preset ' + preset.name);
+    loadBtn.onclick = () => loadPreset(i);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'text-xs px-2 py-1 rounded bg-slate-600 hover:bg-red-700 text-slate-300';
+    delBtn.textContent = 'Del';
+    delBtn.setAttribute('aria-label', 'Delete preset ' + preset.name);
+    delBtn.onclick = () => deletePreset(i);
+
+    actions.appendChild(loadBtn);
+    actions.appendChild(delBtn);
+    row.appendChild(nameEl);
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+renderChannels();
+renderPresets();
+</script>
+</body>
+</html>
